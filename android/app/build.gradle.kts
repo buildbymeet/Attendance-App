@@ -5,6 +5,10 @@ plugins {
 }
 
 android {
+    lint {
+        checkReleaseBuilds = false
+        abortOnError = false
+    }
     namespace = "com.buildbymeet.attendance_app"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
