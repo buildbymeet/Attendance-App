@@ -5,7 +5,6 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
-import 'package:geocoding/geocoding.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:latlong2/latlong.dart';
@@ -41,19 +40,6 @@ Future<Position> _locate() async {
     return pos;
   } on TimeoutException {
     throw 'Could not get a GPS fix. Move to an open area and try again.';
-  }
-}
-
-Future<String?> _address(double lat, double lng) async {
-  try {
-    final l = await placemarkFromCoordinates(lat, lng).timeout(const Duration(seconds: 6));
-    if (l.isEmpty) return null;
-    final p = l.first;
-    return [p.street, p.subLocality, p.locality, p.administrativeArea, p.postalCode]
-        .where((e) => e != null && e.trim().isNotEmpty)
-        .join(', ');
-  } catch (_) {
-    return null;
   }
 }
 
@@ -93,7 +79,7 @@ Future<Capture?> captureAttendance(BuildContext context, {required String title}
   if (bytes.length > 700 * 1024) throw 'Selfie is too large, please retry.';
 
   final pos = await _locate();
-  final addr = await _address(pos.latitude, pos.longitude);
+  const String? addr = null; // street address lookup not bundled; coordinates + map link are stored
   final dev = '${defaultTargetPlatform.name} ${Platform.operatingSystemVersion}';
   final cap = Capture(bytes, base64Encode(bytes), pos.latitude, pos.longitude, pos.accuracy, addr,
       dev.length > 80 ? dev.substring(0, 80) : dev);
