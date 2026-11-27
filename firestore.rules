@@ -1,0 +1,177 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{db}/documents {
+
+    // ---------- helpers ----------
+    function signedIn() { return request.auth != null; }
+    function me() { return get(/databases/$(db)/documents/users/$(request.auth.uid)).data; }
+    function isActive() { return signedIn() && me().accountStatus == 'active'; }
+    function isAdmin() { return isActive() && me().role == 'admin'; }
+    function pad(n) { return (n < 10 ? '0' : '') + string(n); }
+    // Calendar date in IST (UTC+05:30) of a server timestamp, as yyyy-MM-dd
+    function istDate(t) {
+      let d = t + duration.value(330, 'm');
+      return string(d.year()) + '-' + pad(d.month()) + '-' + pad(d.day());
+    }
+    function phoneOk(p) { return p is string && p.matches('^[6-9][0-9]{9}$'); }
+    // One get() for an approved, unused manual-attendance request owned by the caller for [date].
+    function manualApproved(rid, date) {
+      let q = get(/databases/$(db)/documents/requests/$(rid)).data;
+      return q.userId == request.auth.uid && q.type == 'manual' && q.status == 'approved'
+        && q.used == false && q.date == date;
+    }
+    function reqIn(rid) { return get(/databases/$(db)/documents/requests/$(rid)).data.requestedCheckIn; }
+    function reqOut(rid) { return get(/databases/$(db)/documents/requests/$(rid)).data.requestedCheckOut; }
+
+    // ---------- users ----------
+    // Admin accounts are created out-of-band (tools/seed_admin.js, Admin SDK).
+    // Self sign-up can only ever create role == 'employee'.
+    match /users/{id} {
+      allow read: if signedIn() && (request.auth.uid == id || isAdmin());
+      allow create: if signedIn() && request.auth.uid == id
+        && request.resource.data.keys().hasOnly(['fullName', 'username', 'email', 'phone', 'role', 'accountStatus', 'department', 'employeeCode', 'createdAt'])
+        && request.resource.data.role == 'employee'
+        && request.resource.data.accountStatus == 'active'
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.fullName is string
+        && request.resource.data.fullName.size() >= 2 && request.resource.data.fullName.size() <= 80
+        && request.resource.data.username.matches('^[a-z0-9_.]{3,20}$')
+        && phoneOk(request.resource.data.phone)
+        && request.resource.data.email.lower() == request.auth.token.email.lower()
+        && getAfter(/databases/$(db)/documents/usernames/$(request.resource.data.username)).data.uid == id;
+      allow update: if
+        // employee edits own profile (name / phone only)
+        (request.auth.uid == id && isActive()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['fullName', 'phone'])
+          && phoneOk(request.resource.data.phone)
+          && request.resource.data.fullName.size() >= 2 && request.resource.data.fullName.size() <= 80)
+        ||
+        // admin edits an employee (never role / email / username; cannot deactivate self)
+        (isAdmin() && resource.data.role == 'employee'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['fullName', 'phone', 'department', 'employeeCode', 'accountStatus'])
+          && request.resource.data.accountStatus in ['active', 'inactive']
+          && phoneOk(request.resource.data.phone));
+    }
+
+    // Unique usernames: doc id = lowercase username. Create-only => cannot be stolen or changed.
+    match /usernames/{u} {
+      allow read: if signedIn();
+      allow create: if signedIn() && request.resource.data.keys().hasOnly(['uid'])
+        && request.resource.data.uid == request.auth.uid
+        && u.matches('^[a-z0-9_.]{3,20}$');
+    }
+
+    match /settings/{id} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    match /holidays/{id} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+
+    // ---------- attendance ----------
+    // Doc id = <uid>_<yyyy-MM-dd IST> => at most one record per employee per day (DB-level constraint).
+    match /attendance/{id} {
+      allow read: if isAdmin() || (signedIn() && (resource == null || resource.data.userId == request.auth.uid));
+
+      // Live check-in: time must be the server's, date must be today in IST.
+      allow create: if isActive() && request.resource.data.userId == request.auth.uid
+        && request.resource.data.attendanceType == 'selfie'
+        && id == request.auth.uid + '_' + istDate(request.time)
+        && request.resource.data.date == istDate(request.time)
+        && request.resource.data.checkInTime == request.time
+        && !('checkOutTime' in request.resource.data)
+        && request.resource.data.checkInSelfieId == id + '_in'
+        && existsAfter(/databases/$(db)/documents/selfies/$(id + '_in'))
+        && request.resource.data.checkInLat is number && request.resource.data.checkInLng is number
+        && request.resource.data.checkInLat >= -90 && request.resource.data.checkInLat <= 90
+        && request.resource.data.checkInLng >= -180 && request.resource.data.checkInLng <= 180
+        && request.resource.data.corrected == false;
+
+      // Live check-out: only once, only same IST day, only the checkout fields change.
+      allow update: if isActive() && resource.data.userId == request.auth.uid
+        && resource.data.attendanceType == 'selfie'
+        && !('checkOutTime' in resource.data)
+        && resource.data.date == istDate(request.time)
+        && request.resource.data.checkOutTime == request.time
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['checkOutTime', 'checkOutSelfieId', 'checkOutLat', 'checkOutLng', 'checkOutAccuracy', 'checkOutAddress', 'checkOutDevice', 'status', 'updatedAt'])
+        && request.resource.data.checkOutSelfieId == id + '_out'
+        && existsAfter(/databases/$(db)/documents/selfies/$(id + '_out'))
+        && request.resource.data.checkOutLat is number && request.resource.data.checkOutLng is number;
+
+      // Admin-approved manual entry (create the day's record).
+      allow create: if isActive() && request.resource.data.userId == request.auth.uid
+        && request.resource.data.attendanceType == 'manual'
+        && id == request.auth.uid + '_' + request.resource.data.date
+        && request.resource.data.date <= istDate(request.time)
+        && manualApproved(request.resource.data.requestId, request.resource.data.date)
+        && request.resource.data.checkInTime == reqIn(request.resource.data.requestId)
+        && (!('checkOutTime' in request.resource.data) || request.resource.data.checkOutTime == reqOut(request.resource.data.requestId))
+        && existsAfter(/databases/$(db)/documents/selfies/$(id + '_in'))
+        && request.resource.data.corrected == false;
+
+      // Admin-approved manual entry that only adds the missing check-out.
+      allow update: if isActive() && resource.data.userId == request.auth.uid
+        && !('checkOutTime' in resource.data)
+        && manualApproved(request.resource.data.requestId, resource.data.date)
+        && request.resource.data.checkOutTime == reqOut(request.resource.data.requestId)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['checkOutTime', 'checkOutSelfieId', 'checkOutLat', 'checkOutLng', 'checkOutAccuracy', 'checkOutAddress', 'checkOutDevice', 'status', 'requestId', 'updatedAt'])
+        && existsAfter(/databases/$(db)/documents/selfies/$(id + '_out'));
+
+      // Admin corrections / additions (audit-logged by the app in the same batch). No deletes.
+      allow create, update: if isAdmin();
+    }
+
+    // Selfie images (base64 JPEG). Immutable once written.
+    match /selfies/{id} {
+      allow read: if isAdmin() || (signedIn() && (resource == null || resource.data.userId == request.auth.uid));
+      allow create: if isActive() && request.resource.data.userId == request.auth.uid
+        && id.matches(request.auth.uid + '_.*')
+        && request.resource.data.keys().hasOnly(['userId', 'data', 'createdAt'])
+        && request.resource.data.data is string
+        && request.resource.data.data.size() > 1000 && request.resource.data.data.size() < 900000
+        && request.resource.data.createdAt == request.time;
+    }
+
+    // ---------- manual attendance / leave requests ----------
+    match /requests/{id} {
+      allow read: if isAdmin() || (signedIn() && (resource == null || resource.data.userId == request.auth.uid));
+      allow create: if isActive() && request.resource.data.userId == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.used == false
+        && request.resource.data.type in ['manual', 'leave']
+        && request.resource.data.keys().hasOnly(['userId', 'userName', 'type', 'date', 'endDate', 'requestedCheckIn', 'requestedCheckOut', 'reason', 'notes', 'status', 'adminComment', 'used', 'createdAt'])
+        && request.resource.data.reason is string && request.resource.data.reason.size() >= 3
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        && request.resource.data.endDate >= request.resource.data.date
+        && (request.resource.data.type == 'leave'
+            || (request.resource.data.date <= istDate(request.time) && request.resource.data.requestedCheckIn is timestamp));
+      // employee: cancel while pending
+      allow delete: if signedIn() && resource.data.userId == request.auth.uid && resource.data.status == 'pending';
+      allow update: if
+        // admin decision (cannot decide own request, only pending ones)
+        (isAdmin() && resource.data.status == 'pending' && resource.data.userId != request.auth.uid
+          && request.resource.data.status in ['approved', 'rejected']
+          && request.resource.data.approvedBy == request.auth.uid
+          && request.resource.data.approvedAt == request.time
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'adminComment', 'approvedBy', 'approvedByName', 'approvedAt']))
+        ||
+        // employee consumes an approved manual request (done in the same batch as the attendance write)
+        (isActive() && resource.data.userId == request.auth.uid && resource.data.status == 'approved'
+          && resource.data.type == 'manual' && resource.data.used == false
+          && request.resource.data.used == true
+          && request.resource.data.attendanceId == request.auth.uid + '_' + resource.data.date
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['used', 'attendanceId']));
+    }
+
+    // ---------- audit log: append-only, admin only ----------
+    match /auditLogs/{id} {
+      allow read: if isAdmin();
+      allow create: if isAdmin() && request.resource.data.actorId == request.auth.uid
+        && request.resource.data.timestamp == request.time;
+    }
+  }
+}
